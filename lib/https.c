@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #include <openssl/bio.h>
 #include <openssl/err.h>
@@ -147,6 +148,29 @@ _SSL_check_server_cert(SSL *ssl, const char *hostname)
         X509_free(cert);
         
         return (match > 0);
+}
+
+// Wait msecs milliseconds for the fd to become writable.  Return
+// -1 on error, 0 on timeout, and >0 if the fd is writable.
+static int
+fd_wait_(int fd, int msecs)
+{
+    struct pollfd pfd;
+    int result;
+
+    pfd.fd = fd;
+    pfd.events = POLLOUT | POLLWRBAND;
+    pfd.revents = 0;
+
+    if (msecs < 0) {
+        msecs = -1;
+    }
+
+    result = poll(&pfd, 1, msecs);
+    if (result <= 0) {
+        return result;
+    }
+    return (pfd.revents & pfd.events ? 1 : -1);
 }
 
 // Return -1 on hard error (abort), 0 on timeout, >= 1 on successful wakeup
@@ -308,6 +332,10 @@ https_open(struct https_request **reqp, const char *host)
         char *p;
         int n;
 
+        const char *api_host;
+        const char *api_port;
+        int connected_socket = -1;
+        int socket_error = -1;
         /* Set up our handle */
         n = 1;
         if ((req = calloc(1, sizeof(*req))) == NULL ||
@@ -323,8 +351,7 @@ https_open(struct https_request **reqp, const char *host)
         } else {
                 req->port = "443";
         }
-        if ((req->cbio = BIO_new(BIO_s_connect())) == NULL ||
-            (req->body = BIO_new(BIO_s_mem())) == NULL) {
+        if ((req->body = BIO_new(BIO_s_mem())) == NULL) {
                 ctx->errstr = _SSL_strerror();
                 https_close(&req);
                 return (HTTPS_ERR_LIB);
@@ -332,24 +359,89 @@ https_open(struct https_request **reqp, const char *host)
         http_parser_init(req->parser, HTTP_RESPONSE);
         req->parser->data = req;
 
-        /* Connect to server */
+        // Connect to server
+        // To support IPv6 connections, manually create and connect the
+        // socket, and pass the connected socket to the BIO wrapper.
         if (ctx->proxy) {
-                BIO_set_conn_hostname(req->cbio, ctx->proxy);
-                BIO_set_conn_port(req->cbio, ctx->proxy_port);
+            api_host = ctx->proxy;
+            api_port = ctx->proxy_port;
         } else {
-                BIO_set_conn_hostname(req->cbio, req->host);
-                BIO_set_conn_port(req->cbio, req->port);
+            api_host = req->host;
+            api_port = req->port;
         }
-        BIO_set_nbio(req->cbio, 1);
-        
-        while (BIO_do_connect(req->cbio) <= 0) {
-                if ((n = _BIO_wait(req->cbio, 10000)) != 1) {
-                        ctx->errstr = n ? _SSL_strerror() :
-                            "Connection timed out";
-                        https_close(&req);
-                        return (n ? HTTPS_ERR_SYSTEM : HTTPS_ERR_SERVER);
+
+        {
+            // Address Lookup
+            struct addrinfo *res = NULL;
+            struct addrinfo *cur_res = NULL;
+            struct addrinfo hints;
+            int error;
+
+            memset(&hints, 0, sizeof(hints));
+            hints.ai_family = PF_UNSPEC;
+            hints.ai_socktype = SOCK_STREAM;
+
+            error = getaddrinfo(api_host,
+                    api_port,
+                    &hints,
+                    &res);
+            if (error) {
+                ctx->errstr = gai_strerror(error);
+                https_close(&req);
+                return HTTPS_ERR_SYSTEM;
+            }
+
+            // Connect
+            for (cur_res = res; cur_res; cur_res = cur_res->ai_next) {
+                int connretries = 3;
+                while (connected_socket == -1 && connretries--) {
+                    int sock_flags;
+
+                    connected_socket = socket(cur_res->ai_family,
+                            cur_res->ai_socktype,
+                            cur_res->ai_protocol);
+                    if (connected_socket == -1) {
+                        continue;
+                    }
+                    sock_flags = fcntl(connected_socket, F_GETFL, 0);
+                    fcntl(connected_socket, F_SETFL, sock_flags|O_NONBLOCK);
+
+                    if (connect(connected_socket, cur_res->ai_addr, cur_res->ai_addrlen) != 0 &&
+                            errno != EINPROGRESS) {
+                        close(connected_socket);
+                        connected_socket = -1;
+                        break;
+                    }
+                    socket_error = fd_wait_(connected_socket, 10000);
+                    if (socket_error != 1) {
+                        close(connected_socket);
+                        connected_socket = -1;
+                        continue;
+                    }
+                    // Connected!
+                    break;
                 }
+            }
+            cur_res = NULL;
+            freeaddrinfo(res);
+            res = NULL;
         }
+
+        if (connected_socket == -1) {
+            ctx->errstr = "Failed to connect";
+            https_close(&req);
+            return socket_error ? HTTPS_ERR_SYSTEM : HTTPS_ERR_SERVER;
+        }
+
+        if ((req->cbio = BIO_new_socket(connected_socket, BIO_CLOSE)) == NULL) {
+            ctx->errstr = _SSL_strerror();
+            https_close(&req);
+            return (HTTPS_ERR_LIB);
+        }
+        BIO_set_conn_hostname(req->cbio, api_host);
+        BIO_set_conn_port(req->cbio, api_port);
+        BIO_set_nbio(req->cbio, 1);
+
         /* Tunnel through proxy, if specified */
         if (ctx->proxy != NULL) {
                 BIO_printf(req->cbio,
