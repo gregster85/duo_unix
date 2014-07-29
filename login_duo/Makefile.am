@@ -9,7 +9,7 @@ notrans_dist_man8_MANS = login_duo.8
 
 install-exec-hook:
 	-chown root $(DESTDIR)$(sbindir)/login_duo && \
-	 chmod 4755 $(DESTDIR)$(sbindir)/login_duo
+	 chmod 755 $(DESTDIR)$(sbindir)/login_duo
 
 install-data-local:
 	$(MKDIR_P) $(DESTDIR)$(sysconfdir)
